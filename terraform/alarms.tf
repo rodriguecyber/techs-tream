@@ -20,7 +20,7 @@ resource "aws_cloudwatch_metric_alarm" "high_latency" {
   namespace           = var.cw_namespace
   metric_name         = "AverageLatencyMs"
   dimensions          = { Service = "techstream-api" }
-  extended_statistic  = "p99"
+  statistic           = "Average"
   period              = 60
   evaluation_periods  = 3
   threshold           = var.latency_threshold_ms
@@ -44,6 +44,3 @@ resource "aws_cloudwatch_metric_alarm" "high_cpu" {
   alarm_actions       = [aws_sns_topic.alerts.arn]
 }
 
-# Composite alarm removed — costs $0.50/month and is not covered by free tier.
-# The three standard alarms above are free (free tier includes 10).
-# Remediation still works: the EventBridge rule catches every techstream-* alarm independently.

@@ -36,7 +36,7 @@ variable "cpu_threshold" {
 
 variable "instance_type" {
   type        = string
-  description = "EC2 instance type — t2.micro is free tier eligible"
+  description = "EC2 instance type — t3.micro is free tier eligible"
   default     = "t3.micro"
 }
 

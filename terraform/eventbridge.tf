@@ -4,10 +4,10 @@ resource "aws_cloudwatch_event_rule" "remediation" {
   state       = "ENABLED"
 
   event_pattern = jsonencode({
-    source      = ["aws.cloudwatch"]
+    source        = ["aws.cloudwatch"]
     "detail-type" = ["CloudWatch Alarm State Change"]
     detail = {
-      alarmName = [{ prefix = "techstream-" }]
+      alarmName = ["techstream-high-error-rate"]
       state = {
         value = ["ALARM"]
       }

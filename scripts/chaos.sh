@@ -111,25 +111,30 @@ generate_traffic() {
   log "Generating ~${rps} req/s for ${duration}s against $APP_URL"
 
   local end=$(( SECONDS + duration ))
-  local total=0 errors=0
+  local total=0 errors=0 total_latency_ms=0
 
   while [[ $SECONDS -lt $end ]]; do
-    local code
+    local start_ms code elapsed_ms
+    start_ms=$(date +%s%3N 2>/dev/null || echo 0)
     code=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 5 \
            "$APP_URL/api/data" 2>/dev/null || echo "000")
+    elapsed_ms=$(( $(date +%s%3N 2>/dev/null || echo 0) - start_ms ))
     total=$(( total + 1 ))
+    total_latency_ms=$(( total_latency_ms + elapsed_ms ))
     if [[ "$code" == "000" ]] || [[ "$code" -ge 500 ]]; then
       errors=$(( errors + 1 ))
     fi
     sleep "$delay" 2>/dev/null || sleep 0.05
   done
 
-  local error_pct=0
+  local error_pct=0 avg_latency_ms=0
   [[ $total -gt 0 ]] && error_pct=$(( errors * 100 / total ))
-  log "Traffic done — $total reqs | $errors errors | ${error_pct}% error rate"
+  [[ $total -gt 0 ]] && avg_latency_ms=$(( total_latency_ms / total ))
+  log "Traffic done — $total reqs | $errors errors | ${error_pct}% error rate | ${avg_latency_ms}ms avg latency"
 
-  publish_metric ErrorRate    "$error_pct"
-  publish_metric RequestCount "$total"
+  publish_metric ErrorRate        "$error_pct"
+  publish_metric RequestCount     "$total"
+  publish_metric AverageLatencyMs "$avg_latency_ms"
 }
 
 # ── Full end-to-end chaos scenario ────────────────────────────────────────────

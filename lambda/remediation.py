@@ -1,250 +1,177 @@
 """
-TechStream — Self-Healing Lambda
-Triggered by EventBridge when a CloudWatch Alarm fires.
+TechStream — Self-Healing Lambda (Python / boto3)
+Triggered by EventBridge when the high-error-rate CloudWatch Alarm fires.
 
-Remediation actions (attempted in order):
-  1. Restart the web server process via SSM Run Command
-  2. If restart fails or instance is unresponsive → scale out the ASG
-  3. Publish a remediation event to CloudWatch and SNS for audit trail
+Remediation steps (in order):
+  1. Restart the app service on the EC2 instance via SSM Run Command
+  2. If restart fails → reboot the EC2 instance entirely
+  3. Publish a remediation metric and SNS notification for audit trail
 """
 
 import json
-import boto3
-import logging
 import os
 import time
-from datetime import datetime, timezone
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+import boto3
 
-# ── Config from environment variables (set in Lambda config) ─────────────────
-ASG_NAME        = os.environ.get("ASG_NAME",        "techstream-asg")
-SNS_TOPIC_ARN   = os.environ.get("SNS_TOPIC_ARN",   "")
-AWS_REGION      = os.environ.get("AWS_REGION",       "us-east-1")
-SSM_DOCUMENT    = os.environ.get("SSM_DOCUMENT",    "AWS-RunShellScript")
-APP_SERVICE     = os.environ.get("APP_SERVICE",     "techstream-app")
-NAMESPACE       = os.environ.get("CW_NAMESPACE",    "TechStream/App")
+INSTANCE_ID   = os.environ.get("INSTANCE_ID", "")
+SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
+REGION        = os.environ.get("AWS_REGION", "us-east-1")
+APP_SERVICE   = os.environ.get("APP_SERVICE", "techstream-app")
+NAMESPACE     = os.environ.get("CW_NAMESPACE", "TechStream/App")
 
-ec2  = boto3.client("ec2",          region_name=AWS_REGION)
-ssm  = boto3.client("ssm",          region_name=AWS_REGION)
-asg  = boto3.client("autoscaling",  region_name=AWS_REGION)
-cw   = boto3.client("cloudwatch",   region_name=AWS_REGION)
-sns  = boto3.client("sns",          region_name=AWS_REGION)
+ssm = boto3.client("ssm", region_name=REGION)
+ec2 = boto3.client("ec2", region_name=REGION)
+cw  = boto3.client("cloudwatch", region_name=REGION)
+sns = boto3.client("sns", region_name=REGION)
 
 
 def handler(event, context):
-    """Main Lambda entry point — called by EventBridge."""
-    logger.info(f"Remediation triggered. Event: {json.dumps(event)}")
+    print("Remediation triggered. Event:", json.dumps(event))
 
-    alarm_name  = _extract_alarm_name(event)
-    alarm_state = _extract_alarm_state(event)
-    timestamp   = datetime.now(timezone.utc).isoformat()
+    alarm_name  = event.get("detail", {}).get("alarmName", "unknown-alarm")
+    alarm_state = event.get("detail", {}).get("state", {}).get("value", "ALARM")
 
-    # Only remediate on ALARM state, ignore OK transitions
     if alarm_state == "OK":
-        logger.info("Alarm returned to OK — no remediation needed")
+        print("Alarm returned to OK — no remediation needed")
         return {"status": "no_action", "reason": "alarm_resolved"}
 
-    logger.warning(f"Alarm '{alarm_name}' entered ALARM state — starting remediation")
+    if not INSTANCE_ID:
+        print("INSTANCE_ID env var is not set")
+        return {"status": "error", "reason": "missing_instance_id"}
 
-    remediation_result = {
-        "alarm":     alarm_name,
-        "timestamp": timestamp,
-        "steps":     []
-    }
+    print(f"Alarm '{alarm_name}' is ALARM — starting remediation on {INSTANCE_ID}")
 
-    # ── Step 1: Try SSM restart ───────────────────────────────────────────────
-    instance_ids = _get_asg_instance_ids()
-    if instance_ids:
-        logger.info(f"Found {len(instance_ids)} instances: {instance_ids}")
-        ssm_success = _restart_via_ssm(instance_ids)
-        remediation_result["steps"].append({
-            "action":  "ssm_restart",
-            "success": ssm_success,
-            "targets": instance_ids
-        })
+    result = {"alarm": alarm_name, "instance": INSTANCE_ID, "steps": []}
 
-        if ssm_success:
-            logger.info("SSM restart succeeded — waiting 30s to verify recovery")
-            time.sleep(30)
-            if _verify_health(instance_ids):
-                logger.info("Health check passed after SSM restart")
-                remediation_result["outcome"] = "self_healed_via_restart"
-                _publish_remediation_metric("RemediationSuccess", 1)
-                _notify_team(remediation_result, success=True)
-                return remediation_result
-            else:
-                logger.warning("Health check failed after SSM restart — escalating to scale-out")
+    # Step 1: SSM service restart
+    ssm_success = _restart_via_ssm(INSTANCE_ID)
+    result["steps"].append({"action": "ssm_restart", "success": ssm_success})
+
+    if ssm_success:
+        print("SSM restart succeeded — waiting 30s to verify recovery")
+        time.sleep(30)
+        if _verify_instance_running(INSTANCE_ID):
+            print("Instance healthy after SSM restart")
+            result["outcome"] = "self_healed_via_restart"
+            _publish_metric("RemediationSuccess", 1)
+            _notify_team(result, success=True)
+            return result
+        print("Instance unhealthy after restart — escalating to reboot")
+
+    # Step 2: EC2 reboot
+    print("Attempting EC2 instance reboot...")
+    reboot_success = _reboot_instance(INSTANCE_ID)
+    result["steps"].append({"action": "ec2_reboot", "success": reboot_success})
+
+    if reboot_success:
+        result["outcome"] = "self_healed_via_reboot"
+        _publish_metric("RemediationSuccess", 1)
     else:
-        logger.warning("No healthy instances found in ASG")
+        result["outcome"] = "remediation_failed_page_engineer"
+        _publish_metric("RemediationFailure", 1)
+        print("All remediation steps failed — engineer must be paged")
 
-    # ── Step 2: Scale out ASG ─────────────────────────────────────────────────
-    logger.info("Attempting ASG scale-out...")
-    scale_success = _scale_out_asg()
-    remediation_result["steps"].append({
-        "action":  "asg_scale_out",
-        "success": scale_success
-    })
-
-    if scale_success:
-        remediation_result["outcome"] = "self_healed_via_scale_out"
-        _publish_remediation_metric("RemediationSuccess", 1)
-    else:
-        remediation_result["outcome"] = "remediation_failed_page_engineer"
-        _publish_remediation_metric("RemediationFailure", 1)
-        logger.error("All remediation steps failed — engineer must be paged")
-
-    _notify_team(remediation_result, success=scale_success)
-    return remediation_result
+    _notify_team(result, success=reboot_success)
+    return result
 
 
-# ── Remediation actions ───────────────────────────────────────────────────────
+# ── Remediation helpers ───────────────────────────────────────────────────────
 
-def _restart_via_ssm(instance_ids: list) -> bool:
-    """Restart the app service on all instances via SSM Run Command."""
+def _restart_via_ssm(instance_id):
     commands = [
         f"systemctl restart {APP_SERVICE}",
-        f"sleep 5",
-        f"systemctl is-active {APP_SERVICE} || (echo 'Service failed to start' && exit 1)",
+        "sleep 5",
+        f'systemctl is-active {APP_SERVICE} || (echo "Service failed to start" && exit 1)',
     ]
     try:
-        response = ssm.send_command(
-            InstanceIds   = instance_ids,
-            DocumentName  = SSM_DOCUMENT,
-            Parameters    = {"commands": commands},
-            TimeoutSeconds= 60,
-            Comment       = f"TechStream self-healing restart at {datetime.now(timezone.utc).isoformat()}"
+        resp = ssm.send_command(
+            InstanceIds=[instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": commands},
+            TimeoutSeconds=60,
+            Comment="TechStream self-healing restart",
         )
-        command_id = response["Command"]["CommandId"]
-        logger.info(f"SSM command sent: {command_id}")
+        command_id = resp["Command"]["CommandId"]
+        print(f"SSM command sent: {command_id}")
 
-        # Poll for completion (max 90 seconds)
-        for _ in range(18):
+        terminal = {"Success", "Failed", "TimedOut", "Cancelled"}
+        for _ in range(18):  # poll up to 90 s
             time.sleep(5)
-            result = ssm.list_command_invocations(CommandId=command_id, Details=True)
-            invocations = result.get("CommandInvocations", [])
+            invocations = ssm.list_command_invocations(
+                CommandId=command_id, Details=True
+            ).get("CommandInvocations", [])
             if not invocations:
                 continue
-            statuses = [i["Status"] for i in invocations]
-            logger.info(f"SSM statuses: {statuses}")
-            if all(s in ("Success", "Failed", "TimedOut") for s in statuses):
+            statuses = [inv["Status"] for inv in invocations]
+            print(f"SSM status: {statuses}")
+            if all(s in terminal for s in statuses):
                 success = all(s == "Success" for s in statuses)
-                logger.info(f"SSM command completed — success={success}")
+                print(f"SSM command completed — success={success}")
                 return success
 
-        logger.warning("SSM command timed out waiting for completion")
+        print("SSM command timed out")
         return False
-    except Exception as e:
-        logger.error(f"SSM restart failed: {e}")
+    except Exception as exc:
+        print(f"SSM restart failed: {exc}")
         return False
 
 
-def _scale_out_asg() -> bool:
-    """Increase ASG desired capacity by 2 to bring in fresh instances."""
+def _reboot_instance(instance_id):
     try:
-        response = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[ASG_NAME])
-        groups = response.get("AutoScalingGroups", [])
-        if not groups:
-            logger.error(f"ASG '{ASG_NAME}' not found")
-            return False
-
-        group       = groups[0]
-        current     = group["DesiredCapacity"]
-        maximum     = group["MaxSize"]
-        new_desired = min(current + 2, maximum)
-
-        if new_desired <= current:
-            logger.warning(f"Already at max capacity ({maximum}) — cannot scale out")
-            return False
-
-        asg.set_desired_capacity(
-            AutoScalingGroupName = ASG_NAME,
-            DesiredCapacity      = new_desired,
-            HonorCooldown        = False   # bypass cooldown during incident
-        )
-        logger.info(f"ASG scaled out: {current} → {new_desired} instances")
+        ec2.reboot_instances(InstanceIds=[instance_id])
+        print(f"EC2 reboot issued for {instance_id}")
         return True
-    except Exception as e:
-        logger.error(f"ASG scale-out failed: {e}")
+    except Exception as exc:
+        print(f"EC2 reboot failed: {exc}")
         return False
 
 
-def _verify_health(instance_ids: list) -> bool:
-    """Check that instances are in InService state in the ASG."""
+def _verify_instance_running(instance_id):
     try:
-        response = asg.describe_auto_scaling_instances(InstanceIds=instance_ids)
-        instances = response.get("AutoScalingInstances", [])
-        healthy   = [i for i in instances if i.get("LifecycleState") == "InService"
-                     and i.get("HealthStatus") == "Healthy"]
-        logger.info(f"Health check: {len(healthy)}/{len(instance_ids)} instances healthy")
-        return len(healthy) >= max(1, len(instance_ids) // 2)
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
+        resp = ec2.describe_instances(InstanceIds=[instance_id])
+        state = (
+            resp.get("Reservations", [{}])[0]
+                .get("Instances", [{}])[0]
+                .get("State", {})
+                .get("Name", "")
+        )
+        print(f"Instance state: {state}")
+        return state == "running"
+    except Exception as exc:
+        print(f"Instance state check failed: {exc}")
         return False
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _get_asg_instance_ids() -> list:
-    """Return list of instance IDs currently InService in the ASG."""
-    try:
-        response = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[ASG_NAME])
-        groups   = response.get("AutoScalingGroups", [])
-        if not groups:
-            return []
-        instances = groups[0].get("Instances", [])
-        return [i["InstanceId"] for i in instances if i.get("LifecycleState") == "InService"]
-    except Exception as e:
-        logger.error(f"Could not get ASG instances: {e}")
-        return []
-
-
-def _extract_alarm_name(event: dict) -> str:
-    try:
-        detail = event.get("detail", {})
-        return detail.get("alarmName", event.get("source", "unknown-alarm"))
-    except Exception:
-        return "unknown-alarm"
-
-
-def _extract_alarm_state(event: dict) -> str:
-    try:
-        return event.get("detail", {}).get("state", {}).get("value", "ALARM")
-    except Exception:
-        return "ALARM"
-
-
-def _publish_remediation_metric(metric_name: str, value: float):
+def _publish_metric(metric_name, value):
     try:
         cw.put_metric_data(
-            Namespace  = NAMESPACE,
-            MetricData = [{
+            Namespace=NAMESPACE,
+            MetricData=[{
                 "MetricName": metric_name,
-                "Value":      value,
-                "Unit":       "Count",
-                "Dimensions": [{"Name": "Service", "Value": "techstream-api"}]
-            }]
+                "Value": value,
+                "Unit": "Count",
+                "Dimensions": [{"Name": "Service", "Value": "techstream-api"}],
+            }],
         )
-    except Exception as e:
-        logger.warning(f"Could not publish CloudWatch metric: {e}")
+    except Exception as exc:
+        print(f"Could not publish CloudWatch metric: {exc}")
 
 
-def _notify_team(result: dict, success: bool):
-    """Send remediation summary to SNS (→ email / PagerDuty / Slack)."""
+def _notify_team(result, success):
     if not SNS_TOPIC_ARN:
         return
     subject = (
-        "✅ TechStream self-healed successfully"
-        if success else
-        "🚨 TechStream remediation FAILED — engineer required"
+        "TechStream self-healed successfully"
+        if success
+        else "TechStream remediation FAILED — engineer required"
     )
     try:
         sns.publish(
-            TopicArn = SNS_TOPIC_ARN,
-            Subject  = subject,
-            Message  = json.dumps(result, indent=2, default=str)
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=subject,
+            Message=json.dumps(result, indent=2),
         )
-        logger.info(f"SNS notification sent: {subject}")
-    except Exception as e:
-        logger.error(f"SNS publish failed: {e}")
+        print(f"SNS notification sent: {subject}")
+    except Exception as exc:
+        print(f"SNS publish failed: {exc}")
